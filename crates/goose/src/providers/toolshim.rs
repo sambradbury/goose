@@ -351,6 +351,11 @@ pub fn convert_tool_messages_to_text(messages: &[Message]) -> Vec<Message> {
                         };
                         new_content.push(MessageContent::text(text));
                     }
+                    MessageContent::Image(_) => {
+                        // Skip image content in toolshim mode - images are not supported
+                        // This prevents the "Image inputs are not supported by this model" error
+                        continue;
+                    }
                     _ => {
                         // Keep other content types as-is
                         new_content.push(content.clone());

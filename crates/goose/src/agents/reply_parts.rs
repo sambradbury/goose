@@ -116,12 +116,80 @@ impl Agent {
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let config = provider.get_model_config();
 
-        // Convert tool messages to text if toolshim is enabled
-        let messages_for_provider = if config.toolshim {
-            convert_tool_messages_to_text(messages)
+        tracing::info!("🔍 generate_response_from_provider: provider supports image generation: {}", provider.supports_image_generation());
+        tracing::info!("🔍 generate_response_from_provider: input messages count: {}", messages.len());
+
+        // Log the content types of input messages
+        for (i, msg) in messages.iter().enumerate() {
+            let content_types: Vec<&str> = msg.content.iter().map(|c| match c {
+                MessageContent::Text(_) => "text",
+                MessageContent::Image(_) => "image",
+                MessageContent::ToolRequest(_) => "tool_request",
+                MessageContent::ToolResponse(_) => "tool_response",
+                _ => "other",
+            }).collect();
+            tracing::info!("🔍 generate_response_from_provider: message {} content types: {:?}", i, content_types);
+
+            // Log the actual content for debugging
+            for (j, content) in msg.content.iter().enumerate() {
+                match content {
+                    MessageContent::Text(text) => {
+                        tracing::info!("🔍 generate_response_from_provider: message {} content {} (text): '{}'", i, j, text.text);
+                    }
+                    MessageContent::Image(image) => {
+                        tracing::info!("🔍 generate_response_from_provider: message {} content {} (image): mime_type='{}', data_length={}", i, j, image.mime_type, image.data.len());
+                    }
+                    _ => {
+                        tracing::info!("🔍 generate_response_from_provider: message {} content {} (other): {:?}", i, j, content);
+                    }
+                }
+            }
+        }
+
+        // Filter out image content if the model doesn't support image generation
+        let messages_for_provider = if !provider.supports_image_generation() {
+            tracing::info!("🖼️ Filtering out image content for text-only model in generate_response_from_provider");
+            let filtered = messages.iter().map(|msg| {
+                let mut filtered_msg = msg.clone();
+                let original_count = filtered_msg.content.len();
+                filtered_msg.content.retain(|content| {
+                    !matches!(content, MessageContent::Image(_))
+                });
+                let filtered_count = filtered_msg.content.len();
+                if original_count != filtered_count {
+                    tracing::info!("🖼️ Removed {} image content items from message", original_count - filtered_count);
+                }
+                filtered_msg
+            }).collect::<Vec<_>>();
+
+            // Verify filtering worked
+            let has_images = filtered.iter().any(|msg| {
+                msg.content.iter().any(|content| matches!(content, MessageContent::Image(_)))
+            });
+            if has_images {
+                tracing::error!("❌ Filtering failed in generate_response_from_provider - images still present!");
+            } else {
+                tracing::info!("✅ Filtering successful in generate_response_from_provider - no images in filtered messages");
+            }
+
+            filtered
         } else {
+            tracing::info!("🖼️ No filtering needed - model supports image generation");
             messages.to_vec()
         };
+
+        tracing::info!("🔍 generate_response_from_provider: filtered messages count: {}", messages_for_provider.len());
+
+        // Convert tool messages to text if toolshim is enabled
+        let messages_for_provider = if config.toolshim {
+            tracing::info!("🔧 Applying toolshim conversion");
+            convert_tool_messages_to_text(&messages_for_provider)
+        } else {
+            tracing::info!("🔧 No toolshim conversion needed");
+            messages_for_provider
+        };
+
+        tracing::info!("🔍 generate_response_from_provider: final messages count: {}", messages_for_provider.len());
 
         // Call the provider to get a response
         let (mut response, usage) = provider
@@ -221,6 +289,7 @@ impl Agent {
         session_config: crate::agents::types::SessionConfig,
         usage: &crate::providers::base::ProviderUsage,
         messages_length: usize,
+        current_model: &str,
     ) -> Result<()> {
         let session_file_path = session::storage::get_path(session_config.id.clone());
         let mut metadata = session::storage::read_metadata(&session_file_path)?;
@@ -232,6 +301,9 @@ impl Agent {
         metadata.output_tokens = usage.usage.output_tokens;
 
         metadata.message_count = messages_length + 1;
+
+        // Track the current model
+        metadata.last_model = Some(current_model.to_string());
 
         let accumulate = |a: Option<i32>, b: Option<i32>| -> Option<i32> {
             match (a, b) {

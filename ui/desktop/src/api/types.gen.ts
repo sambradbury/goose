@@ -389,6 +389,10 @@ export type SessionMetadata = {
      */
     input_tokens?: number | null;
     /**
+     * The last model used in this session
+     */
+    last_model?: string | null;
+    /**
      * Number of messages in the session
      */
     message_count: number;

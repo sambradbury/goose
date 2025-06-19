@@ -41,6 +41,8 @@ pub struct SessionMetadata {
     pub accumulated_input_tokens: Option<i32>,
     /// The number of output tokens used in the session. Accumulated across all messages.
     pub accumulated_output_tokens: Option<i32>,
+    /// The last model used in this session
+    pub last_model: Option<String>,
 }
 
 // Custom deserializer to handle old sessions without working_dir
@@ -61,6 +63,7 @@ impl<'de> Deserialize<'de> for SessionMetadata {
             accumulated_input_tokens: Option<i32>,
             accumulated_output_tokens: Option<i32>,
             working_dir: Option<PathBuf>,
+            last_model: Option<String>,
         }
 
         let helper = Helper::deserialize(deserializer)?;
@@ -82,6 +85,7 @@ impl<'de> Deserialize<'de> for SessionMetadata {
             accumulated_input_tokens: helper.accumulated_input_tokens,
             accumulated_output_tokens: helper.accumulated_output_tokens,
             working_dir,
+            last_model: helper.last_model,
         })
     }
 }
@@ -106,6 +110,7 @@ impl SessionMetadata {
             accumulated_total_tokens: None,
             accumulated_input_tokens: None,
             accumulated_output_tokens: None,
+            last_model: None,
         }
     }
 }
@@ -493,6 +498,14 @@ pub async fn generate_description(
     messages: &[Message],
     provider: Arc<dyn Provider>,
 ) -> Result<()> {
+    // Skip description generation for image-only models
+    if provider.supports_image_generation() {
+        // This is an image-only model, skip description generation
+        let mut metadata = read_metadata(session_file)?;
+        metadata.description = "Image generation session".to_string();
+        return save_messages_with_metadata(session_file, &metadata, messages);
+    }
+
     // Create a special message asking for a 3-word description
     let mut description_prompt = "Based on the conversation so far, provide a concise description of this session in 4 words or less. This will be used for finding the session later in a UI with limited space - reply *ONLY* with the description".to_string();
 
@@ -659,7 +672,7 @@ mod tests {
             "]}}\"\\n\\\"{[",
             "Edge case: } ] some text",
             "{\"foo\": \"} ]\"}",
-            "}]",   
+            "}]",
         ];
 
         let mut messages = Vec::new();

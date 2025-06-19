@@ -1,16 +1,18 @@
 use super::errors::ProviderError;
-use crate::message::Message;
+use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage, ImageGenerationResult};
+use crate::message::{Message, MessageContent};
 use crate::model::ModelConfig;
-use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
 use crate::providers::utils::get_model;
 use anyhow::Result;
 use async_trait::async_trait;
 use mcp_core::Tool;
+use mcp_core::content::ImageContent;
 use reqwest::{Client, StatusCode};
-use serde_json::Value;
-use std::time::Duration;
-use url::Url;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tracing;
 
 pub const XAI_API_HOST: &str = "https://api.x.ai/v1";
 pub const XAI_DEFAULT_MODEL: &str = "grok-3";
@@ -61,7 +63,7 @@ impl XaiProvider {
             .unwrap_or_else(|_| XAI_API_HOST.to_string());
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(600))
+            .timeout(std::time::Duration::from_secs(120)) // 2 minute timeout
             .build()?;
 
         Ok(Self {
@@ -72,24 +74,21 @@ impl XaiProvider {
         })
     }
 
+    /// Check if the current model supports image generation
+    fn is_image_generation_model(&self) -> bool {
+        self.model.model_name.contains("image")
+    }
+
     async fn post(&self, payload: Value) -> anyhow::Result<Value, ProviderError> {
-        // Ensure the host ends with a slash for proper URL joining
-        let host = if self.host.ends_with('/') {
-            self.host.clone()
-        } else {
-            format!("{}/", self.host)
-        };
-        let base_url = Url::parse(&host)
-            .map_err(|e| ProviderError::RequestFailed(format!("Invalid base URL: {e}")))?;
-        let url = base_url.join("chat/completions").map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
-        })?;
+        let url = format!("{}/chat/completions", self.host);
 
-        tracing::debug!("xAI API URL: {}", url);
-        tracing::debug!("xAI request model: {:?}", self.model.model_name);
+        tracing::debug!(
+            url = %url,
+            payload = ?payload,
+            "Making request to xAI API"
+        );
 
-        let response = self
-            .client
+        let response = self.client
             .post(url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&payload)
@@ -97,28 +96,83 @@ impl XaiProvider {
             .await?;
 
         let status = response.status();
-        let payload: Option<Value> = response.json().await.ok();
+        let response_data = response.json::<Value>().await.ok();
+
+        tracing::debug!(
+            status = %status,
+            response_data = ?response_data,
+            "Received response from xAI API"
+        );
 
         match status {
-            StatusCode::OK => payload.ok_or_else( || ProviderError::RequestFailed("Response body is not valid JSON".to_string()) ),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                Err(ProviderError::Authentication(format!("Authentication failed. Please ensure your API keys are valid and have the required permissions. \
-                    Status: {}. Response: {:?}", status, payload)))
+            StatusCode::OK => {
+                response_data.ok_or_else(|| {
+                    ProviderError::RequestFailed("No response data received".to_string())
+                })
             }
-            StatusCode::PAYLOAD_TOO_LARGE => {
-                Err(ProviderError::ContextLengthExceeded(format!("{:?}", payload)))
+            StatusCode::BAD_REQUEST => {
+                tracing::error!("❌ Bad request with status: {}", status);
+                tracing::error!("📦 Request payload that caused bad request: {}", serde_json::to_string(&payload).unwrap());
+
+                let error_msg = if let Some(data) = response_data {
+                    tracing::error!("📄 Response data: {}", serde_json::to_string(&data).unwrap());
+                    let data_owned = data.clone();
+                    let error_val = data_owned.get("error");
+                    let message_val = match error_val {
+                        Some(e) => e.get("message"),
+                        None => None,
+                    };
+                    let msg = match message_val {
+                        Some(m) => m.as_str(),
+                        None => None,
+                    };
+                    match msg {
+                        Some(s) => s.to_string(),
+                        None => "Bad request".to_string(),
+                    }
+                } else {
+                    "Bad request".to_string()
+                };
+
+                Err(ProviderError::RequestFailed(format!(
+                    "Request failed: {}", error_msg
+                )))
             }
-            StatusCode::TOO_MANY_REQUESTS => {
-                Err(ProviderError::RateLimitExceeded(format!("{:?}", payload)))
+            StatusCode::UNAUTHORIZED => {
+                Err(ProviderError::Authentication(
+                    "Invalid API key".to_string(),
+                ))
             }
-            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => {
-                Err(ProviderError::ServerError(format!("{:?}", payload)))
+            StatusCode::NOT_FOUND => {
+                tracing::error!(
+                    "404 Not Found for URL: {}/chat/completions",
+                    self.host
+                );
+                Err(ProviderError::RequestFailed(
+                    "API endpoint not found (404)".to_string(),
+                ))
             }
             _ => {
-                tracing::debug!(
-                    "{}", format!("Provider request failed with status: {}. Payload: {:?}", status, payload)
-                );
-                Err(ProviderError::RequestFailed(format!("Request failed with status: {}", status)))
+                let error_msg = if let Some(data) = response_data {
+                    let data_owned = data.clone();
+                    let error_val = data_owned.get("error");
+                    let message_val = match error_val {
+                        Some(e) => e.get("message"),
+                        None => None,
+                    };
+                    let msg = match message_val {
+                        Some(m) => m.as_str(),
+                        None => None,
+                    };
+                    match msg {
+                        Some(s) => s.to_string(),
+                        None => format!("HTTP {}", status),
+                    }
+                } else {
+                    format!("HTTP {}", status)
+                };
+
+                Err(ProviderError::RequestFailed(error_msg))
             }
         }
     }
@@ -155,6 +209,27 @@ impl Provider for XaiProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> anyhow::Result<(Message, ProviderUsage), ProviderError> {
+        tracing::info!("🔍 xAI complete: received {} messages", messages.len());
+
+        // Log the content types of messages received by xAI
+        for (i, msg) in messages.iter().enumerate() {
+            let content_types: Vec<&str> = msg.content.iter().map(|c| match c {
+                MessageContent::Text(_) => "text",
+                MessageContent::Image(_) => "image",
+                MessageContent::ToolRequest(_) => "tool_request",
+                MessageContent::ToolResponse(_) => "tool_response",
+                _ => "other",
+            }).collect();
+            tracing::info!("🔍 xAI complete: message {} content types: {:?}", i, content_types);
+        }
+
+        // Check if this is an image generation model being used for text completion
+        if self.is_image_generation_model() {
+            return Err(ProviderError::ExecutionError(
+                format!("Model {} is for image generation, not text completion", self.model.model_name)
+            ));
+        }
+
         let payload = create_request(
             &self.model,
             system,
@@ -177,5 +252,206 @@ impl Provider for XaiProvider {
         let model = get_model(&response);
         super::utils::emit_debug_trace(&self.model, &payload, &response, &usage);
         Ok((message, ProviderUsage::new(model, usage)))
+    }
+
+    fn supports_image_generation(&self) -> bool {
+        self.is_image_generation_model()
+    }
+
+    /// Generate images using xAI's simplified API (only supports prompt)
+    async fn generate_images(
+        &self,
+        prompt: String,
+    ) -> Result<ImageGenerationResult, ProviderError> {
+        let start_time = std::time::Instant::now();
+        tracing::info!(
+            "🎨 Starting xAI image generation - model: {}, prompt: '{}'",
+            self.model.model_name,
+            prompt
+        );
+
+        // Check if this is an image generation model
+        if !self.is_image_generation_model() {
+            return Err(ProviderError::ExecutionError(
+                format!("Model {} does not support image generation", self.model.model_name)
+            ));
+        }
+
+        // Use the correct xAI images endpoint
+        let url = format!("{}/images/generations", self.host);
+        tracing::info!("🔗 Constructed URL: {}", url);
+
+        // xAI only supports: model, prompt, n, response_format
+        let payload = json!({
+            "model": self.model.model_name,
+            "prompt": prompt,
+            "n": 1,
+            "response_format": "b64_json"
+        });
+
+        tracing::info!("📦 Request payload: {}", serde_json::to_string(&payload).unwrap());
+        tracing::info!("🔑 Using API key: {}...", &self.api_key[..8.min(self.api_key.len())]);
+
+        let http_start = std::time::Instant::now();
+        tracing::info!("📡 Making HTTP request to xAI API...");
+
+        let response = match self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&payload)
+            .send()
+            .await {
+                Ok(resp) => {
+                    tracing::info!("✅ HTTP request succeeded");
+                    resp
+                }
+                Err(e) => {
+                    tracing::error!("❌ HTTP request failed: {}", e);
+                    return Err(ProviderError::RequestFailed(format!("HTTP request failed: {}", e)));
+                }
+            };
+
+        let http_duration = http_start.elapsed();
+        tracing::info!("📥 HTTP request completed in {:?}, status: {}", http_duration, response.status());
+
+        // Log response headers
+        tracing::info!("📋 Response headers:");
+        for (name, value) in response.headers() {
+            if let Ok(value_str) = value.to_str() {
+                tracing::info!("  {}: {}", name, value_str);
+            }
+        }
+
+        let status = response.status();
+        let json_start = std::time::Instant::now();
+        tracing::info!("🔄 Parsing response JSON...");
+
+        // First, let's get the raw response text to see what we're actually getting
+        let response_text = match response.text().await {
+            Ok(text) => {
+                tracing::info!("✅ Response text received, length: {}", text.len());
+                text
+            }
+            Err(e) => {
+                tracing::error!("❌ Failed to get response text: {}", e);
+                return Err(ProviderError::RequestFailed(format!("Failed to get response text: {}", e)));
+            }
+        };
+
+        tracing::info!("📄 Raw response text (first 500 chars): {}", &response_text[..response_text.len().min(500)]);
+
+        // Now parse it as JSON
+        let response_data: Result<Value, _> = serde_json::from_str(&response_text);
+        let response_data = match response_data {
+            Ok(data) => {
+                tracing::info!("✅ JSON parsing successful");
+                Some(data)
+            }
+            Err(e) => {
+                tracing::error!("❌ JSON parsing failed: {}", e);
+                None
+            }
+        };
+
+        let json_duration = json_start.elapsed();
+        tracing::info!("✅ JSON parsing completed in {:?}", json_duration);
+
+        tracing::info!("📊 Processing response with status: {}", status);
+
+        match status {
+            StatusCode::OK => {
+                tracing::info!("✅ Status OK, processing response data...");
+                let data = response_data.ok_or_else(|| {
+                    ProviderError::RequestFailed("Response body is not valid JSON".to_string())
+                })?;
+
+                tracing::info!("🔍 Extracting image data from response...");
+                // Parse the response to extract image data
+                let images = data.get("data")
+                    .and_then(|d| d.as_array())
+                    .ok_or_else(|| {
+                        ProviderError::RequestFailed("Invalid response format: missing data array".to_string())
+                    })?;
+
+                tracing::info!("🖼️ Found {} images in response", images.len());
+
+                let mut image_contents = Vec::new();
+                for (i, image_data) in images.iter().enumerate() {
+                    tracing::info!("📸 Processing image {} of {}", i + 1, images.len());
+                    let b64_data = image_data.get("b64_json")
+                        .and_then(|b| b.as_str())
+                        .ok_or_else(|| {
+                            ProviderError::RequestFailed("Invalid image data: missing b64_json".to_string())
+                        })?;
+
+                    tracing::info!("📏 Image {} base64 data length: {} characters", i + 1, b64_data.len());
+
+                    image_contents.push(ImageContent {
+                        mime_type: "image/jpeg".to_string(),
+                        data: b64_data.to_string(),
+                        annotations: None,
+                    });
+                }
+
+                let usage = Usage::new(None, None, None);
+                let provider_usage = ProviderUsage::new(self.model.model_name.clone(), usage);
+
+                let total_duration = start_time.elapsed();
+                tracing::info!("✅ Image generation completed in {:?} - generated {} images", total_duration, image_contents.len());
+
+                Ok(ImageGenerationResult {
+                    images: image_contents,
+                    usage: provider_usage,
+                })
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                tracing::error!("❌ Authentication failed with status: {}", status);
+                Err(ProviderError::Authentication(format!(
+                    "Authentication failed. Status: {}. Response: {:?}", status, response_data
+                )))
+            }
+            StatusCode::BAD_REQUEST => {
+                tracing::error!("❌ Bad request with status: {}", status);
+                tracing::error!("📦 Request payload that caused bad request: {}", serde_json::to_string(&payload).unwrap());
+
+                let error_msg = if let Some(data) = response_data {
+                    tracing::error!("📄 Response data: {}", serde_json::to_string(&data).unwrap());
+                    let data_owned = data.clone();
+                    let error_val = data_owned.get("error");
+                    let message_val = match error_val {
+                        Some(e) => e.get("message"),
+                        None => None,
+                    };
+                    let msg = match message_val {
+                        Some(m) => m.as_str(),
+                        None => None,
+                    };
+                    match msg {
+                        Some(s) => s.to_string(),
+                        None => "Bad request".to_string(),
+                    }
+                } else {
+                    "Bad request".to_string()
+                };
+
+                Err(ProviderError::RequestFailed(format!(
+                    "Request failed: {}", error_msg
+                )))
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                tracing::error!("❌ Rate limit exceeded");
+                Err(ProviderError::RateLimitExceeded(format!("{:?}", response_data)))
+            }
+            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => {
+                tracing::error!("❌ Server error with status: {}", status);
+                Err(ProviderError::ServerError(format!("{:?}", response_data)))
+            }
+            _ => {
+                tracing::error!("❌ Unexpected status: {}", status);
+                Err(ProviderError::RequestFailed(format!(
+                    "Image generation failed with status: {}", status
+                )))
+            }
+        }
     }
 }

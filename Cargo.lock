@@ -5366,6 +5366,7 @@ dependencies = [
  "mcp-core",
  "nix 0.30.1",
  "rand 0.8.5",
+ "regex",
  "reqwest 0.11.27",
  "serde",
  "serde_json",

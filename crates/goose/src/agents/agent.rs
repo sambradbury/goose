@@ -4,14 +4,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use base64::prelude::*;
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, TryStreamExt};
 use futures_util::stream;
 use futures_util::stream::StreamExt;
 use mcp_core::protocol::JsonRpcMessage;
+use mcp_core::role::Role;
+use rand::Rng;
 
 use crate::config::{Config, ExtensionConfigManager, PermissionManager};
-use crate::message::Message;
+use crate::message::{Message, MessageContent};
 use crate::permission::permission_judge::check_tool_permissions;
 use crate::permission::PermissionConfirmation;
 use crate::providers::base::Provider;
@@ -571,20 +574,192 @@ impl Agent {
             debug!("user_message" = &content);
         }
 
+        let provider_guard = self.provider.lock().await;
+        let provider = provider_guard.as_ref().unwrap();
+
+        // Check if this provider supports image generation
+        let is_image_model = provider.supports_image_generation();
+        let current_model = provider.get_model_config().model_name.clone();
+
+        // If this is NOT an image model, filter out image content from messages
+        let messages_to_send = if !is_image_model {
+            let filtered = messages.iter().map(|msg| {
+                let mut filtered_msg = msg.clone();
+                filtered_msg.content.retain(|content| {
+                    !matches!(content, MessageContent::Image(_))
+                });
+                filtered_msg
+            }).collect::<Vec<_>>();
+
+            // Verify filtering worked
+            let has_images = filtered.iter().any(|msg| {
+                msg.content.iter().any(|content| matches!(content, MessageContent::Image(_)))
+            });
+            if has_images {
+                tracing::error!("❌ Filtering failed - images still present in filtered messages!");
+            } else {
+                tracing::info!("✅ Filtering successful - no images in filtered messages");
+            }
+
+            filtered
+        } else {
+            messages.to_vec()
+        };
+
+        // If this is an image model, always generate images
+        if is_image_model {
+
+            // Try image generation, but fall back to text if it fails
+            match self.generate_images_from_prompt(&messages, provider).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    tracing::warn!("Image generation failed: {}. Falling back to text mode.", e);
+
+                    // Add a user-friendly message about the fallback
+                    let fallback_message = Message::assistant().with_text(
+                        format!("I tried to generate an image but encountered an issue: {}. I'll respond with text instead.", e)
+                    );
+
+                    return Ok(Box::pin(async_stream::try_stream! {
+                        yield AgentEvent::Message(fallback_message);
+                    }));
+                }
+            }
+        }
+
+        // Otherwise, proceed with normal text completion
+        let response = match provider.complete(&system_prompt, &messages_to_send, &tools).await {
+            Ok((message, usage)) => {
+                tracing::debug!(
+                    message = ?message,
+                    usage = ?usage,
+                    "Provider completed successfully"
+                );
+                Ok((message, usage))
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    system = %system_prompt,
+                    messages_count = messages_to_send.len(),
+                    tools_count = tools.len(),
+                    "Provider completion failed"
+                );
+                Err(e)
+            }
+        };
+
+        let (result, _usage) = response?;
+
+        let content = result.as_concat_text();
+
+        // the response may be contained in ```json ```, strip that before parsing json
+        let re = Regex::new(r"(?s)```[^\n]*\n(.*?)\n```").unwrap();
+        let clean_content = re
+            .captures(&content)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+            .unwrap_or(&content)
+            .trim()
+            .to_string();
+
+        // try to parse json response from the LLM
+        let (instructions, activities) =
+            if let Ok(json_content) = serde_json::from_str::<Value>(&clean_content) {
+                let instructions = json_content
+                    .get("instructions")
+                    .ok_or_else(|| anyhow!("Missing 'instructions' in json response"))?
+                    .as_str()
+                    .ok_or_else(|| anyhow!("instructions' is not a string"))?
+                    .to_string();
+
+                let activities = json_content
+                    .get("activities")
+                    .ok_or_else(|| anyhow!("Missing 'activities' in json response"))?
+                    .as_array()
+                    .ok_or_else(|| anyhow!("'activities' is not an array'"))?
+                    .iter()
+                    .map(|act| {
+                        act.as_str()
+                            .map(|s| s.to_string())
+                            .ok_or(anyhow!("'activities' array element is not a string"))
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                (instructions, activities)
+            } else {
+                // If we can't get valid JSON, try string parsing
+                // Use split_once to get the content after "Instructions:".
+                let after_instructions = content
+                    .split_once("instructions:")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(&content);
+
+                // Split once more to separate instructions from activities.
+                let (instructions_part, activities_text) = after_instructions
+                    .split_once("activities:")
+                    .unwrap_or((after_instructions, ""));
+
+                let instructions = instructions_part
+                    .trim_end_matches(|c: char| c.is_whitespace() || c == '#')
+                    .trim()
+                    .to_string();
+                let activities_text = activities_text.trim();
+
+                // Regex to remove bullet markers or numbers with an optional dot.
+                let bullet_re = Regex::new(r"^[•\-\*\d]+\.?\s*").expect("Invalid regex");
+
+                // Process each line in the activities section.
+                let activities: Vec<String> = activities_text
+                    .lines()
+                    .map(|line| bullet_re.replace(line, "").to_string())
+                    .map(|s| s.trim().to_string())
+                    .filter(|line| !line.is_empty())
+                    .collect();
+
+                (instructions, activities)
+            };
+
+        let extensions = ExtensionConfigManager::get_all().unwrap_or_default();
+        let extension_configs: Vec<_> = extensions
+            .iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.config.clone())
+            .collect();
+
+        let author = Author {
+            contact: std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .ok(),
+            metadata: None,
+        };
+
+        // Ideally we'd get the name of the provider we are using from the provider itself
+        // but it doesn't know and the plumbing looks complicated.
+        let config = Config::global();
+        let provider_name: String = config
+            .get_param("GOOSE_PROVIDER")
+            .expect("No provider configured. Run 'goose configure' first");
+
+        let settings = Settings {
+            goose_provider: Some(provider_name.clone()),
+            goose_model: Some(current_model.clone()),
+            temperature: Some(provider.get_model_config().temperature.unwrap_or(0.0)),
+        };
+
         Ok(Box::pin(async_stream::try_stream! {
             let _ = reply_span.enter();
             loop {
                 match Self::generate_response_from_provider(
                     self.provider().await?,
                     &system_prompt,
-                    &messages,
+                    &messages_to_send,
                     &tools,
                     &toolshim_tools,
                 ).await {
                     Ok((response, usage)) => {
                         // record usage for the session in the session file
                         if let Some(session_config) = session.clone() {
-                            Self::update_session_metrics(session_config, &usage, messages.len()).await?;
+                            Self::update_session_metrics(session_config, &usage, messages_to_send.len(), &current_model).await?;
                         }
 
                         // categorize the type of requests we need to handle
@@ -787,6 +962,9 @@ impl Agent {
 
     /// Update the provider used by this agent
     pub async fn update_provider(&self, provider: Arc<dyn Provider>) -> Result<()> {
+        let new_model = provider.get_model_config().model_name.clone();
+        let new_supports_image = provider.supports_image_generation();
+
         *self.provider.lock().await = Some(provider.clone());
         self.update_router_tool_selector(provider).await?;
         Ok(())
@@ -894,7 +1072,8 @@ impl Agent {
         let extensions_info = extension_manager.get_extensions_info().await;
 
         // Get model name from provider
-        let provider = self.provider().await?;
+        let provider_guard = self.provider.lock().await;
+        let provider = provider_guard.as_ref().unwrap();
         let model_config = provider.get_model_config();
         let model_name = &model_config.model_name;
 
@@ -912,14 +1091,28 @@ impl Agent {
 
         messages.push(Message::user().with_text(recipe_prompt));
 
-        let (result, _usage) = self
-            .provider
-            .lock()
-            .await
-            .as_ref()
-            .unwrap()
-            .complete(&system_prompt, &messages, &tools)
-            .await?;
+        let response = match provider.complete(&system_prompt, &messages, &tools).await {
+            Ok((message, usage)) => {
+                tracing::debug!(
+                    message = ?message,
+                    usage = ?usage,
+                    "Provider completed successfully"
+                );
+                Ok((message, usage))
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    system = %system_prompt,
+                    messages_count = messages.len(),
+                    tools_count = tools.len(),
+                    "Provider completion failed"
+                );
+                Err(e)
+            }
+        };
+
+        let (result, _usage) = response?;
 
         let content = result.as_concat_text();
 
@@ -1029,4 +1222,65 @@ impl Agent {
 
         Ok(recipe)
     }
+
+    /// Generate images from a text prompt
+    async fn generate_images_from_prompt(&self, messages: &[Message], provider: &Arc<dyn Provider>) -> Result<Pin<Box<dyn Stream<Item = Result<AgentEvent, anyhow::Error>> + Send>>, anyhow::Error> {
+
+        // Extract the prompt from the last user message
+        let prompt = if let Some(last_message) = messages.last() {
+            if last_message.role == Role::User {
+                last_message.as_concat_text()
+            } else {
+                return Err(anyhow!("No user message found for image generation"));
+            }
+        } else {
+            return Err(anyhow!("No messages found for image generation"));
+        };
+
+        // Generate the image using the simplified interface
+        let result = provider.generate_images(prompt).await?;
+
+        // Save the generated image to a temporary file
+        let image_message = if let Some(image) = result.images.first() {
+
+            // Create temp directory path (same as UI expects)
+            let temp_dir = std::env::temp_dir().join("goose-pasted-images");
+            std::fs::create_dir_all(&temp_dir)?;
+
+            // Generate unique filename
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let random_string = format!("{:x}", rand::random::<u32>());
+            let filename = format!("pasted-generated-{}-{}.png", timestamp, random_string);
+            let file_path = temp_dir.join(&filename);
+
+            // Decode base64 data and save to file
+            let image_data = base64::prelude::BASE64_STANDARD.decode(&image.data)
+                .map_err(|e| anyhow!("Failed to decode base64 image data: {}", e))?;
+
+            std::fs::write(&file_path, &image_data)
+                .map_err(|e| anyhow!("Failed to save image to temp file: {}", e))?;
+
+            // Create message with the file path instead of base64 data
+            let image_path = file_path.to_string_lossy().to_string();
+
+            // Create a message with both text content and image content
+            let mut message = Message::assistant();
+            message = message.with_content(MessageContent::Text(mcp_core::content::TextContent {
+                text: format!("Generated image: {}", image_path),
+                annotations: None,
+            }));
+            message = message.with_content(MessageContent::Image(image.clone()));
+            message
+        } else {
+            return Err(anyhow!("No images generated"));
+        };
+
+        Ok(Box::pin(async_stream::try_stream! {
+            yield AgentEvent::Message(image_message);
+        }))
+    }
+
 }

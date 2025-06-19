@@ -207,6 +207,28 @@ pub trait Provider: Send + Sync {
     fn as_lead_worker(&self) -> Option<&dyn LeadWorkerProviderTrait> {
         None
     }
+
+    /// Check if this provider supports image generation
+    fn supports_image_generation(&self) -> bool {
+        false
+    }
+
+    /// Generate images from a text prompt
+    async fn generate_images(
+        &self,
+        _prompt: String,
+    ) -> Result<ImageGenerationResult, ProviderError> {
+        Err(ProviderError::ExecutionError(
+            "This provider does not support image generation".to_string(),
+        ))
+    }
+}
+
+/// Image generation result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenerationResult {
+    pub images: Vec<mcp_core::content::ImageContent>,
+    pub usage: ProviderUsage,
 }
 
 #[cfg(test)]

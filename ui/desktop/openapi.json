@@ -10,7 +10,7 @@
     "license": {
       "name": "Apache-2.0"
     },
-    "version": "1.0.28"
+    "version": "1.0.29"
   },
   "paths": {
     "/agent/tools": {
@@ -2081,6 +2081,11 @@
             "type": "integer",
             "format": "int32",
             "description": "The number of input tokens used in the session. Retrieved from the provider's last usage.",
+            "nullable": true
+          },
+          "last_model": {
+            "type": "string",
+            "description": "The last model used in this session",
             "nullable": true
           },
           "message_count": {
